@@ -11,7 +11,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Blender Render Queue")
-            .with_inner_size([900.0, 650.0]),
+            .with_inner_size([1100.0, 700.0]),
         ..Default::default()
     };
     eframe::run_native(

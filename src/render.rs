@@ -1,4 +1,4 @@
-use crate::config::{Config, Job, clean};
+use crate::config::{Job, Scene, clean};
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -7,18 +7,24 @@ use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-pub fn args(file: &str, job: &Job) -> Vec<String> {
+pub enum Outcome {
+    Done,
+    Failed,
+    Cancelled,
+}
+
+pub fn args(file: &str, scene: &Scene) -> Vec<String> {
     let mut args = vec![
         "-b".into(),
         clean(file).into(),
         "-S".into(),
-        job.scene.trim().into(),
+        scene.name.trim().into(),
         "-s".into(),
-        job.start.to_string(),
+        scene.start.to_string(),
         "-e".into(),
-        job.end.to_string(),
+        scene.end.to_string(),
     ];
-    let output = clean(&job.output);
+    let output = clean(&scene.output);
     if !output.is_empty() {
         args.extend(["-o".into(), output.into()]);
     }
@@ -38,48 +44,58 @@ pub fn blender_command(blender: &str) -> Command {
     cmd
 }
 
-pub fn spawn(config: Config, cancel: Arc<AtomicBool>, log: Sender<String>) {
+pub fn spawn(
+    blender: String,
+    job: Job,
+    cancel: Arc<AtomicBool>,
+    log: Sender<String>,
+) -> JoinHandle<Outcome> {
     thread::spawn(move || {
         let mut failed = Vec::new();
-        for job in config.enabled_jobs() {
+        for scene in job.enabled_scenes() {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             let _ = log.send(format!(
                 "==== {}  frames {}-{} ====",
-                job.scene, job.start, job.end
+                scene.name, scene.start, scene.end
             ));
-            match run_job(&config, job, &cancel, &log) {
+            match run_scene(&blender, &job.file, scene, &cancel, &log) {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
-                    let _ = log.send(format!("[FAILED] {} ({status})", job.scene));
-                    failed.push(job.scene.clone());
+                    let _ = log.send(format!("[FAILED] {} ({status})", scene.name));
+                    failed.push(scene.name.clone());
                 }
                 Err(e) => {
-                    let _ = log.send(format!("[ERROR] {}: {e}", job.scene));
-                    failed.push(job.scene.clone());
+                    let _ = log.send(format!("[ERROR] {}: {e}", scene.name));
+                    failed.push(scene.name.clone());
                 }
             }
         }
-        let summary = if cancel.load(Ordering::Relaxed) {
-            "Cancelled.".to_string()
+        let (summary, outcome) = if cancel.load(Ordering::Relaxed) {
+            ("Cancelled.".to_string(), Outcome::Cancelled)
         } else if failed.is_empty() {
-            "All renders done.".to_string()
+            ("All renders done.".to_string(), Outcome::Done)
         } else {
-            format!("Done with failures: {}", failed.join(", "))
+            (
+                format!("Done with failures: {}", failed.join(", ")),
+                Outcome::Failed,
+            )
         };
         let _ = log.send(summary);
-    });
+        outcome
+    })
 }
 
-fn run_job(
-    config: &Config,
-    job: &Job,
+fn run_scene(
+    blender: &str,
+    file: &str,
+    scene: &Scene,
     cancel: &AtomicBool,
     log: &Sender<String>,
 ) -> std::io::Result<ExitStatus> {
-    let mut child = blender_command(&config.blender)
-        .args(args(&config.file, job))
+    let mut child = blender_command(blender)
+        .args(args(file, scene))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -121,20 +137,20 @@ fn forward(src: Option<impl Read + Send + 'static>, log: Sender<String>) -> Join
 mod tests {
     use super::*;
 
-    fn job(output: &str) -> Job {
-        Job {
-            scene: "BG_Cycles".into(),
+    fn scene(output: &str) -> Scene {
+        Scene {
+            name: "BG_Cycles".into(),
             start: 1,
             end: 2,
             output: output.into(),
-            ..Job::default()
+            ..Scene::default()
         }
     }
 
     #[test]
     fn builds_args_in_blender_order() {
         assert_eq!(
-            args("\"D:\\a.blend\"", &job("")),
+            args("\"D:\\a.blend\"", &scene("")),
             [
                 "-b",
                 "D:\\a.blend",
@@ -152,7 +168,7 @@ mod tests {
     #[test]
     fn output_goes_before_animation_flag() {
         assert_eq!(
-            args("a.blend", &job("D:\\out\\")),
+            args("a.blend", &scene("D:\\out\\")),
             [
                 "-b",
                 "a.blend",

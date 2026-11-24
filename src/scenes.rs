@@ -1,4 +1,4 @@
-use crate::config::{Job, clean};
+use crate::config::{Scene, clean};
 use crate::render::blender_command;
 use serde::Deserialize;
 
@@ -6,24 +6,24 @@ const MARKER: &str = "SCENES_JSON:";
 const SCRIPT: &str = "import bpy, json; print('SCENES_JSON:' + json.dumps([{'name': s.name, 'start': s.frame_start, 'end': s.frame_end} for s in bpy.data.scenes]))";
 
 #[derive(Deserialize)]
-struct Scene {
+struct BlendScene {
     name: String,
     start: i32,
     end: i32,
 }
 
-impl From<Scene> for Job {
-    fn from(s: Scene) -> Self {
-        Job {
-            scene: s.name,
+impl From<BlendScene> for Scene {
+    fn from(s: BlendScene) -> Self {
+        Scene {
+            name: s.name,
             start: s.start.max(0) as u32,
             end: s.end.max(0) as u32,
-            ..Job::default()
+            ..Scene::default()
         }
     }
 }
 
-pub fn list(blender: &str, file: &str) -> Result<Vec<Job>, String> {
+pub fn list(blender: &str, file: &str) -> Result<Vec<Scene>, String> {
     let out = blender_command(blender)
         .args([
             "-b",
@@ -51,13 +51,13 @@ fn tail(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-fn parse(stdout: &str) -> Result<Vec<Job>, String> {
+fn parse(stdout: &str) -> Result<Vec<Scene>, String> {
     let json = stdout
         .lines()
         .find_map(|line| line.strip_prefix(MARKER))
         .ok_or("Blender did not return a scene list")?;
-    let scenes: Vec<Scene> = serde_json::from_str(json).map_err(|e| e.to_string())?;
-    Ok(scenes.into_iter().map(Job::from).collect())
+    let scenes: Vec<BlendScene> = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    Ok(scenes.into_iter().map(Scene::from).collect())
 }
 
 #[cfg(test)]
@@ -67,13 +67,13 @@ mod tests {
     #[test]
     fn parses_scene_line_from_blender_output() {
         let out = "Blender 5.2\nRead blend: x.blend\nSCENES_JSON:[{\"name\": \"BG_Cycles\", \"start\": 1, \"end\": 250}, {\"name\": \"CH\", \"start\": -5, \"end\": 10}]\nBlender quit\n";
-        let jobs = parse(out).unwrap();
-        assert_eq!(jobs.len(), 2);
+        let scenes = parse(out).unwrap();
+        assert_eq!(scenes.len(), 2);
         assert_eq!(
-            (jobs[0].scene.as_str(), jobs[0].start, jobs[0].end),
+            (scenes[0].name.as_str(), scenes[0].start, scenes[0].end),
             ("BG_Cycles", 1, 250)
         );
-        assert_eq!((jobs[1].start, jobs[1].end), (0, 10));
+        assert_eq!((scenes[1].start, scenes[1].end), (0, 10));
     }
 
     #[test]
