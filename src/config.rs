@@ -69,6 +69,16 @@ impl Config {
         Ok(())
     }
 
+    pub fn add_jobs(&mut self, jobs: Vec<Job>) -> usize {
+        let before = self.jobs.len();
+        for job in jobs {
+            if !self.jobs.iter().any(|j| j.scene == job.scene) {
+                self.jobs.push(job);
+            }
+        }
+        self.jobs.len() - before
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.validate_paths()?;
         if self.enabled_jobs().next().is_none() {

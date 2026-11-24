@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod render;
+mod scenes;
 
 use eframe::egui;
 

@@ -1,5 +1,5 @@
 use crate::config::{Config, Job};
-use crate::render;
+use crate::{render, scenes};
 use eframe::egui;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +18,7 @@ pub struct App {
     saved: Config,
     log: String,
     run: Option<Run>,
+    scan: Option<Receiver<Result<Vec<Job>, String>>>,
 }
 
 impl App {
@@ -28,6 +29,7 @@ impl App {
             config,
             log: String::new(),
             run: None,
+            scan: None,
         }
     }
 
@@ -41,6 +43,37 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         render::spawn(self.config.clone(), cancel.clone(), tx);
         self.run = Some(Run { log: rx, cancel });
+    }
+
+    fn load_scenes(&mut self) {
+        if let Err(e) = self.config.validate_paths() {
+            self.log.push_str(&format!("[ERROR] {e}\n"));
+            return;
+        }
+        self.log.push_str("Reading scenes from .blend…\n");
+        let (tx, rx) = mpsc::channel();
+        let (blender, file) = (self.config.blender.clone(), self.config.file.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(scenes::list(&blender, &file));
+        });
+        self.scan = Some(rx);
+    }
+
+    fn poll_scan(&mut self) {
+        let Some(scan) = &self.scan else { return };
+        let msg = match scan.try_recv() {
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => "[ERROR] Scene reader stopped".to_string(),
+            Ok(Err(e)) => format!("[ERROR] {e}"),
+            Ok(Ok(jobs)) => {
+                let found = jobs.len();
+                let added = self.config.add_jobs(jobs);
+                format!("Found {found} scenes, added {added} new")
+            }
+        };
+        self.log.push_str(&msg);
+        self.log.push('\n');
+        self.scan = None;
     }
 
     fn poll(&mut self) {
@@ -77,7 +110,7 @@ impl App {
     }
 
     fn setup_ui(&mut self, ui: &mut egui::Ui) {
-        egui::Grid::new("paths").num_columns(3).show(ui, |ui| {
+        egui::Grid::new("paths").num_columns(4).show(ui, |ui| {
             ui.label("Blender exe");
             path_field(ui, &mut self.config.blender);
             if ui.button("Browse…").clicked()
@@ -93,6 +126,14 @@ impl App {
                 && let Some(p) = pick_file("Blend file", "blend")
             {
                 self.config.file = p;
+                self.load_scenes();
+            }
+            if ui
+                .button("Load scenes")
+                .on_hover_text("Add every scene in the .blend as a job")
+                .clicked()
+            {
+                self.load_scenes();
             }
             ui.end_row();
         });
@@ -158,18 +199,20 @@ fn pick_file(name: &str, ext: &str) -> Option<String> {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        self.poll_scan();
+        let scanning = self.scan.is_some();
         let running = self.run.is_some();
-        if running {
+        if running || scanning {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         egui::TopBottomPanel::top("setup").show(ctx, |ui| {
             ui.add_space(6.0);
-            ui.add_enabled_ui(!running, |ui| self.setup_ui(ui));
+            ui.add_enabled_ui(!running && !scanning, |ui| self.setup_ui(ui));
             ui.separator();
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!running, egui::Button::new("▶ Render"))
+                    .add_enabled(!running && !scanning, egui::Button::new("▶ Render"))
                     .clicked()
                 {
                     self.start();
@@ -181,9 +224,13 @@ impl eframe::App for App {
                 {
                     run.cancel.store(true, Ordering::Relaxed);
                 }
-                if running {
+                if running || scanning {
                     ui.spinner();
-                    ui.label("Rendering…");
+                    ui.label(if running {
+                        "Rendering…"
+                    } else {
+                        "Reading scenes…"
+                    });
                 }
             });
             ui.add_space(6.0);

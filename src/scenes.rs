@@ -1,0 +1,74 @@
+use crate::config::{Job, clean};
+use crate::render::blender_command;
+use serde::Deserialize;
+
+const MARKER: &str = "SCENES_JSON:";
+const SCRIPT: &str = "import bpy, json; print('SCENES_JSON:' + json.dumps([{'name': s.name, 'start': s.frame_start, 'end': s.frame_end} for s in bpy.data.scenes]))";
+
+#[derive(Deserialize)]
+struct Scene {
+    name: String,
+    start: i32,
+    end: i32,
+}
+
+impl From<Scene> for Job {
+    fn from(s: Scene) -> Self {
+        Job {
+            scene: s.name,
+            start: s.start.max(0) as u32,
+            end: s.end.max(0) as u32,
+            ..Job::default()
+        }
+    }
+}
+
+pub fn list(blender: &str, file: &str) -> Result<Vec<Job>, String> {
+    let out = blender_command(blender)
+        .args([
+            "-b",
+            "--factory-startup",
+            clean(file),
+            "--python-expr",
+            SCRIPT,
+        ])
+        .output()
+        .map_err(|e| format!("Could not start Blender: {e}"))?;
+    parse(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse(stdout: &str) -> Result<Vec<Job>, String> {
+    let json = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(MARKER))
+        .ok_or("Blender did not return a scene list")?;
+    let scenes: Vec<Scene> = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    Ok(scenes.into_iter().map(Job::from).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_scene_line_from_blender_output() {
+        let out = "Blender 5.2\nRead blend: x.blend\nSCENES_JSON:[{\"name\": \"BG_Cycles\", \"start\": 1, \"end\": 250}, {\"name\": \"CH\", \"start\": -5, \"end\": 10}]\nBlender quit\n";
+        let jobs = parse(out).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            (jobs[0].scene.as_str(), jobs[0].start, jobs[0].end),
+            ("BG_Cycles", 1, 250)
+        );
+        assert_eq!((jobs[1].start, jobs[1].end), (0, 10));
+    }
+
+    #[test]
+    fn errors_when_marker_missing() {
+        assert!(parse("Error: cannot read file\n").is_err());
+    }
+
+    #[test]
+    fn script_prints_marker() {
+        assert!(SCRIPT.contains(MARKER));
+    }
+}
