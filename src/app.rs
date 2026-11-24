@@ -77,7 +77,9 @@ impl App {
                 let found = jobs.len();
                 match self.config.apply_scenes(&scan.file, jobs) {
                     (true, _) => format!("New .blend: job list replaced with {found} scenes"),
-                    (false, added) => format!("Found {found} scenes, added {added} new"),
+                    (false, added) => {
+                        format!("Found {found} scenes, added {added} new, frame ranges refreshed")
+                    }
                 }
             }
         };
@@ -142,7 +144,7 @@ impl App {
             }
             if ui
                 .button("Load scenes")
-                .on_hover_text("Add missing scenes from the .blend as jobs")
+                .on_hover_text("Add missing scenes and refresh frame ranges from the .blend")
                 .clicked()
             {
                 self.load_scenes();

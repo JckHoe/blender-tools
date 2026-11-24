@@ -34,7 +34,21 @@ pub fn list(blender: &str, file: &str) -> Result<Vec<Job>, String> {
         ])
         .output()
         .map_err(|e| format!("Could not start Blender: {e}"))?;
-    parse(&String::from_utf8_lossy(&out.stdout))
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse(&stdout).map_err(|e| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = if stderr.trim().is_empty() {
+            &stdout
+        } else {
+            &stderr
+        };
+        format!("{e} ({})\n{}", out.status, tail(detail, 5))
+    })
+}
+
+fn tail(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 fn parse(stdout: &str) -> Result<Vec<Job>, String> {
@@ -65,6 +79,12 @@ mod tests {
     #[test]
     fn errors_when_marker_missing() {
         assert!(parse("Error: cannot read file\n").is_err());
+    }
+
+    #[test]
+    fn tail_keeps_last_non_empty_lines() {
+        assert_eq!(tail("a\n\nb\nc\n\n", 2), "b\nc");
+        assert_eq!(tail("only\n", 5), "only");
     }
 
     #[test]

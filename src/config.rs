@@ -84,14 +84,15 @@ impl Config {
             self.jobs.clear();
         }
         self.jobs_file = file.to_string();
-        (replaced, self.add_jobs(jobs))
+        (replaced, self.merge_jobs(jobs))
     }
 
-    fn add_jobs(&mut self, jobs: Vec<Job>) -> usize {
+    fn merge_jobs(&mut self, jobs: Vec<Job>) -> usize {
         let before = self.jobs.len();
         for job in jobs {
-            if !self.jobs.iter().any(|j| j.scene == job.scene) {
-                self.jobs.push(job);
+            match self.jobs.iter_mut().find(|j| j.scene == job.scene) {
+                Some(j) => (j.start, j.end) = (job.start, job.end),
+                None => self.jobs.push(job),
             }
         }
         self.jobs.len() - before
@@ -135,13 +136,22 @@ mod tests {
     }
 
     #[test]
-    fn same_file_keeps_edits_and_adds_new_scenes() {
-        let mut c = config("a.blend", vec![job("BG", 99)]);
+    fn same_file_refreshes_frames_keeps_settings_and_adds_new_scenes() {
+        let mut c = config(
+            "a.blend",
+            vec![Job {
+                enabled: false,
+                output: "D:\\out\\".into(),
+                ..job("BG", 99)
+            }],
+        );
         assert_eq!(
             c.apply_scenes("\"a.blend\"", vec![job("BG", 1), job("CH", 2)]),
             (false, 1)
         );
-        assert_eq!(c.jobs[0].end, 99);
+        assert_eq!(c.jobs[0].end, 1);
+        assert!(!c.jobs[0].enabled);
+        assert_eq!(c.jobs[0].output, "D:\\out\\");
         assert_eq!(c.jobs[1].scene, "CH");
     }
 
@@ -158,6 +168,7 @@ mod tests {
     fn manual_jobs_without_source_file_are_merged() {
         let mut c = config("", vec![job("BG", 99)]);
         assert_eq!(c.apply_scenes("a.blend", vec![job("BG", 1)]), (false, 0));
-        assert_eq!(c.jobs[0].end, 99);
+        assert_eq!(c.jobs.len(), 1);
+        assert_eq!(c.jobs[0].end, 1);
     }
 }
