@@ -1,0 +1,87 @@
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Job {
+    pub enabled: bool,
+    pub scene: String,
+    pub start: u32,
+    pub end: u32,
+    pub output: String,
+}
+
+impl Default for Job {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scene: String::new(),
+            start: 1,
+            end: 1,
+            output: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub blender: String,
+    pub file: String,
+    pub jobs: Vec<Job>,
+}
+
+// Windows "Copy as path" wraps paths in quotes
+pub fn clean(s: &str) -> &str {
+    s.trim().trim_matches('"')
+}
+
+fn config_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("render-queue.json")))
+        .unwrap_or_else(|| "render-queue.json".into())
+}
+
+impl Config {
+    pub fn load() -> Self {
+        std::fs::read_to_string(config_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        std::fs::write(config_path(), serde_json::to_string_pretty(self)?)
+    }
+
+    pub fn enabled_jobs(&self) -> impl Iterator<Item = &Job> {
+        self.jobs.iter().filter(|j| j.enabled)
+    }
+
+    pub fn validate_paths(&self) -> Result<(), String> {
+        if !Path::new(clean(&self.blender)).is_file() {
+            return Err(format!("Blender not found: {}", self.blender));
+        }
+        if !Path::new(clean(&self.file)).is_file() {
+            return Err(format!(".blend file not found: {}", self.file));
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_paths()?;
+        if self.enabled_jobs().next().is_none() {
+            return Err("No jobs enabled".into());
+        }
+        for job in self.enabled_jobs() {
+            if job.scene.trim().is_empty() {
+                return Err("A job has no scene name".into());
+            }
+            if job.start > job.end {
+                return Err(format!("{}: start frame is after end frame", job.scene));
+            }
+        }
+        Ok(())
+    }
+}
