@@ -28,6 +28,7 @@ impl Default for Job {
 pub struct Config {
     pub blender: String,
     pub file: String,
+    pub jobs_file: String,
     pub jobs: Vec<Job>,
 }
 
@@ -69,7 +70,24 @@ impl Config {
         Ok(())
     }
 
-    pub fn add_jobs(&mut self, jobs: Vec<Job>) -> usize {
+    pub fn has_new_blend(&self) -> bool {
+        let file = clean(&self.file);
+        file != self.jobs_file
+            && file.to_lowercase().ends_with(".blend")
+            && Path::new(file).is_file()
+    }
+
+    pub fn apply_scenes(&mut self, file: &str, jobs: Vec<Job>) -> (bool, usize) {
+        let file = clean(file);
+        let replaced = !self.jobs_file.is_empty() && self.jobs_file != file;
+        if replaced {
+            self.jobs.clear();
+        }
+        self.jobs_file = file.to_string();
+        (replaced, self.add_jobs(jobs))
+    }
+
+    fn add_jobs(&mut self, jobs: Vec<Job>) -> usize {
         let before = self.jobs.len();
         for job in jobs {
             if !self.jobs.iter().any(|j| j.scene == job.scene) {
@@ -93,5 +111,53 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(scene: &str, end: u32) -> Job {
+        Job {
+            scene: scene.into(),
+            end,
+            ..Job::default()
+        }
+    }
+
+    fn config(jobs_file: &str, jobs: Vec<Job>) -> Config {
+        Config {
+            jobs_file: jobs_file.into(),
+            jobs,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn same_file_keeps_edits_and_adds_new_scenes() {
+        let mut c = config("a.blend", vec![job("BG", 99)]);
+        assert_eq!(
+            c.apply_scenes("\"a.blend\"", vec![job("BG", 1), job("CH", 2)]),
+            (false, 1)
+        );
+        assert_eq!(c.jobs[0].end, 99);
+        assert_eq!(c.jobs[1].scene, "CH");
+    }
+
+    #[test]
+    fn different_file_replaces_jobs() {
+        let mut c = config("a.blend", vec![job("Old", 5)]);
+        assert_eq!(c.apply_scenes("b.blend", vec![job("New", 1)]), (true, 1));
+        assert_eq!(c.jobs.len(), 1);
+        assert_eq!(c.jobs[0].scene, "New");
+        assert_eq!(c.jobs_file, "b.blend");
+    }
+
+    #[test]
+    fn manual_jobs_without_source_file_are_merged() {
+        let mut c = config("", vec![job("BG", 99)]);
+        assert_eq!(c.apply_scenes("a.blend", vec![job("BG", 1)]), (false, 0));
+        assert_eq!(c.jobs[0].end, 99);
     }
 }

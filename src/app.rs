@@ -13,12 +13,17 @@ struct Run {
     cancel: Arc<AtomicBool>,
 }
 
+struct Scan {
+    file: String,
+    result: Receiver<Result<Vec<Job>, String>>,
+}
+
 pub struct App {
     config: Config,
     saved: Config,
     log: String,
     run: Option<Run>,
-    scan: Option<Receiver<Result<Vec<Job>, String>>>,
+    scan: Option<Scan>,
 }
 
 impl App {
@@ -53,22 +58,27 @@ impl App {
         self.log.push_str("Reading scenes from .blend…\n");
         let (tx, rx) = mpsc::channel();
         let (blender, file) = (self.config.blender.clone(), self.config.file.clone());
+        self.scan = Some(Scan {
+            file: file.clone(),
+            result: rx,
+        });
         std::thread::spawn(move || {
             let _ = tx.send(scenes::list(&blender, &file));
         });
-        self.scan = Some(rx);
     }
 
     fn poll_scan(&mut self) {
         let Some(scan) = &self.scan else { return };
-        let msg = match scan.try_recv() {
+        let msg = match scan.result.try_recv() {
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => "[ERROR] Scene reader stopped".to_string(),
             Ok(Err(e)) => format!("[ERROR] {e}"),
             Ok(Ok(jobs)) => {
                 let found = jobs.len();
-                let added = self.config.add_jobs(jobs);
-                format!("Found {found} scenes, added {added} new")
+                match self.config.apply_scenes(&scan.file, jobs) {
+                    (true, _) => format!("New .blend: job list replaced with {found} scenes"),
+                    (false, added) => format!("Found {found} scenes, added {added} new"),
+                }
             }
         };
         self.log.push_str(&msg);
@@ -121,7 +131,9 @@ impl App {
             ui.end_row();
 
             ui.label(".blend file");
-            path_field(ui, &mut self.config.file);
+            if path_field(ui, &mut self.config.file).changed() && self.config.has_new_blend() {
+                self.load_scenes();
+            }
             if ui.button("Browse…").clicked()
                 && let Some(p) = pick_file("Blend file", "blend")
             {
@@ -130,7 +142,7 @@ impl App {
             }
             if ui
                 .button("Load scenes")
-                .on_hover_text("Add every scene in the .blend as a job")
+                .on_hover_text("Add missing scenes from the .blend as jobs")
                 .clicked()
             {
                 self.load_scenes();
@@ -185,8 +197,8 @@ impl App {
     }
 }
 
-fn path_field(ui: &mut egui::Ui, value: &mut String) {
-    ui.add(egui::TextEdit::singleline(value).desired_width(520.0));
+fn path_field(ui: &mut egui::Ui, value: &mut String) -> egui::Response {
+    ui.add(egui::TextEdit::singleline(value).desired_width(520.0))
 }
 
 fn pick_file(name: &str, ext: &str) -> Option<String> {
