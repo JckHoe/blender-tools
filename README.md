@@ -19,7 +19,8 @@ Blender exe [.................] Browse        ← shared by all jobs
 
 - **Multiple jobs**: one job per `.blend` file, each with its own scene list, log and Render/Stop.
 - **Parallel renders**: every started job runs its own Blender process; starting one never waits on another.
-- **Render all**: pick jobs in a popup (scenes and frame totals shown, finished jobs unchecked), then they render one after another, for unattended batches (e.g. over a weekend). Failed jobs don't stop the queue. **Stop all** cancels everything.
+- **Render all**: pick jobs in a popup (scenes and frame totals shown, finished jobs unchecked), then they render back to back, for unattended batches (e.g. over a weekend). Failed jobs don't stop the queue. **Stop all** cancels everything.
+- **Max at once / GPU pinning**: the popup detects Cycles GPUs. **Max at once** defaults to 1 (sequential). Raise it to run jobs in parallel; with 2+ GPUs each Blender process is pinned to its own GPU (Cycles only; Eevee uses the display GPU). Your saved Blender preferences are not changed.
 - **Scene loading**: picking a `.blend` reads its scenes and frame ranges automatically. "Load scenes" refreshes frame ranges and adds new scenes, keeping your per-scene settings.
 - **Per-scene options**: enable/disable, frame range, optional output folder.
 - **Status at a glance**: ○ idle, … reading scenes, ⏳ queued, ● rendering, ✔ done, ✖ failed, ⏹ cancelled.

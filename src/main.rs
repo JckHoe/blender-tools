@@ -2,6 +2,8 @@
 
 mod app;
 mod config;
+mod gpus;
+mod probe;
 mod render;
 mod scenes;
 

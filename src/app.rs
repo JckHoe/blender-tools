@@ -1,4 +1,5 @@
 use crate::config::{Config, Job, Scene};
+use crate::gpus::{self, Gpu};
 use crate::render::{Outcome, Task};
 use crate::{render, scenes};
 use eframe::egui;
@@ -19,6 +20,17 @@ struct Run {
 struct Scan {
     file: String,
     result: Receiver<Result<Vec<Scene>, String>>,
+}
+
+struct GpuScan {
+    blender: String,
+    rx: Receiver<Result<Vec<Gpu>, String>>,
+    result: Option<Result<Vec<Gpu>, String>>,
+}
+
+struct Picker {
+    picks: Vec<bool>,
+    parallel: usize,
 }
 
 #[derive(Default)]
@@ -60,7 +72,7 @@ impl JobState {
 
     fn start(&mut self, blender: &str, job: &Job) {
         if let Some(task) = self.prepare(blender, job) {
-            render::spawn(blender.to_string(), vec![task]);
+            render::spawn(blender.to_string(), vec![task], vec![None]);
         }
     }
 
@@ -165,7 +177,8 @@ pub struct App {
     saved: Config,
     states: Vec<JobState>,
     selected: usize,
-    picks: Option<Vec<bool>>,
+    picker: Option<Picker>,
+    gpus: Option<GpuScan>,
 }
 
 impl App {
@@ -176,7 +189,8 @@ impl App {
             saved: config.clone(),
             config,
             selected: 0,
-            picks: None,
+            picker: None,
+            gpus: None,
         }
     }
 
@@ -206,17 +220,49 @@ impl App {
                 self.problem(i).is_none() && !matches!(self.states[i].outcome, Some(Outcome::Done))
             })
             .collect();
-        self.picks = Some(picks);
+        self.picker = Some(Picker { picks, parallel: 1 });
+        self.detect_gpus();
     }
 
-    fn render_all(&mut self, picks: &[bool]) {
+    fn detect_gpus(&mut self) {
+        let blender = self.config.blender.clone();
+        let cached = |g: &GpuScan| g.blender == blender && !matches!(g.result, Some(Err(_)));
+        if self.gpus.as_ref().is_some_and(cached) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let probe = blender.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(gpus::list(&probe));
+        });
+        self.gpus = Some(GpuScan {
+            blender,
+            rx,
+            result: None,
+        });
+    }
+
+    fn detected_gpus(&self) -> Option<Result<&[Gpu], &str>> {
+        match self.gpus.as_ref()?.result.as_ref()? {
+            Ok(gpus) => Some(Ok(gpus)),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn render_all(&mut self, picks: &[bool], parallel: usize) {
         let tasks = (self.states.iter_mut().zip(&self.config.jobs).zip(picks))
             .filter(|((state, _), on)| **on && !state.busy())
             .filter_map(|((state, job), _)| state.prepare(&self.config.blender, job))
             .collect::<Vec<_>>();
-        if !tasks.is_empty() {
-            render::spawn(self.config.blender.clone(), tasks);
+        if tasks.is_empty() {
+            return;
         }
+        let gpus = match self.detected_gpus() {
+            Some(Ok(gpus)) => gpus,
+            _ => &[],
+        };
+        let lanes = gpus::lanes(parallel.min(tasks.len()), gpus);
+        render::spawn(self.config.blender.clone(), tasks, lanes);
     }
 
     fn stop_all(&mut self) {
@@ -227,6 +273,15 @@ impl App {
         for (state, job) in self.states.iter_mut().zip(&mut self.config.jobs) {
             state.poll_run();
             state.poll_scan(job);
+        }
+        if let Some(scan) = &mut self.gpus
+            && scan.result.is_none()
+        {
+            scan.result = match scan.rx.try_recv() {
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("GPU detection stopped".into())),
+                Ok(result) => Some(result),
+            };
         }
     }
 
@@ -344,7 +399,11 @@ impl App {
     }
 
     fn picker_ui(&mut self, ctx: &egui::Context) {
-        let Some(mut picks) = self.picks.take() else {
+        let Some(Picker {
+            mut picks,
+            mut parallel,
+        }) = self.picker.take()
+        else {
             return;
         };
         let problems: Vec<_> = (0..picks.len()).map(|i| self.problem(i)).collect();
@@ -355,12 +414,43 @@ impl App {
         let count = chosen().count();
         let scenes: usize = chosen().map(|(j, _)| j.enabled_scenes().count()).sum();
         let frames: u32 = chosen().map(|(j, _)| j.frames()).sum();
+        let detected = self.detected_gpus();
+        let mut at_once = parallel.clamp(1, count.max(1));
+        let gpu_line = match detected {
+            None => "GPUs: detecting…".to_string(),
+            Some(Err(e)) => format!("GPU detection failed: {}", e.lines().next().unwrap_or("")),
+            Some(Ok([])) => "GPUs: none found by Cycles".to_string(),
+            Some(Ok(g)) => format!(
+                "GPUs ({}): {}",
+                g[0].backend,
+                g.iter()
+                    .map(|g| g.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let gpu_count = match detected {
+            Some(Ok(g)) => g.len(),
+            _ => 0,
+        };
+        let note = match (gpu_count >= 2, at_once) {
+            (true, 1) => format!("Set Max at once to {gpu_count} to run one job per GPU."),
+            (true, _) => "Cycles jobs are spread across GPUs. Eevee uses the display GPU.".into(),
+            (false, 1) => String::new(),
+            (false, _) => {
+                "Parallel jobs share the same CPU/GPU and memory; heavy scenes may fail.".into()
+            }
+        };
 
         let mut start = false;
         let mut cancel = false;
         let modal = egui::Modal::new(egui::Id::new("render_all")).show(ctx, |ui| {
             ui.heading("Render all");
-            ui.label("Selected jobs render one after another.");
+            ui.label(if at_once == 1 {
+                "Selected jobs render one after another.".to_string()
+            } else {
+                format!("Selected jobs render {at_once} at a time.")
+            });
             ui.separator();
             egui::Grid::new("render_all_jobs")
                 .num_columns(5)
@@ -389,11 +479,23 @@ impl App {
                 });
             ui.separator();
             ui.label(format!("{count} jobs · {scenes} scenes · {frames} frames"));
+            ui.separator();
+            ui.label(gpu_line);
+            ui.horizontal(|ui| {
+                ui.label("Max at once");
+                if ui
+                    .add(egui::DragValue::new(&mut at_once).range(1..=count.max(1)))
+                    .changed()
+                {
+                    parallel = at_once;
+                }
+            });
+            ui.weak(note);
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 start = ui
                     .add_enabled(
-                        count > 0,
+                        count > 0 && (at_once == 1 || detected.is_some()),
                         egui::Button::new(format!("▶ Render {count} jobs")),
                     )
                     .clicked();
@@ -402,9 +504,9 @@ impl App {
         });
 
         if start {
-            self.render_all(&picks);
+            self.render_all(&picks, at_once);
         } else if !cancel && !modal.should_close() {
-            self.picks = Some(picks);
+            self.picker = Some(Picker { picks, parallel });
         }
     }
 }
@@ -490,7 +592,8 @@ fn pick_file(name: &str, ext: &str) -> Option<String> {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
-        if self.states.iter().any(JobState::busy) {
+        let detecting = self.gpus.as_ref().is_some_and(|g| g.result.is_none());
+        if self.states.iter().any(JobState::busy) || detecting {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 

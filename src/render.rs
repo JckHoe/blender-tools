@@ -1,9 +1,11 @@
 use crate::config::{Job, Scene, clean};
+use crate::gpus::{self, Gpu};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -13,7 +15,7 @@ pub enum Outcome {
     Cancelled,
 }
 
-pub fn args(file: &str, scene: &Scene) -> Vec<String> {
+pub fn args(file: &str, scene: &Scene, pin: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "-b".into(),
         clean(file).into(),
@@ -27,6 +29,9 @@ pub fn args(file: &str, scene: &Scene) -> Vec<String> {
     let output = clean(&scene.output);
     if !output.is_empty() {
         args.extend(["-o".into(), output.into()]);
+    }
+    if let Some(script) = pin {
+        args.extend(["--python-expr".into(), script.into()]);
     }
     args.push("-a".into());
     args
@@ -51,16 +56,31 @@ pub struct Task {
     pub done: Sender<Outcome>,
 }
 
-pub fn spawn(blender: String, tasks: Vec<Task>) {
-    thread::spawn(move || {
-        for task in tasks {
-            let outcome = render_job(&blender, &task.job, &task.cancel, &task.log);
-            let _ = task.done.send(outcome);
-        }
-    });
+pub fn spawn(blender: String, tasks: Vec<Task>, lanes: Vec<Option<Gpu>>) {
+    let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
+    for gpu in lanes {
+        let (blender, queue) = (blender.clone(), queue.clone());
+        thread::spawn(move || {
+            let pin = gpu.as_ref().map(gpus::pin_script);
+            // A closure so the lock guard drops before rendering; `while let` would hold it
+            let next = || queue.lock().ok()?.pop_front();
+            while let Some(task) = next() {
+                if let Some(gpu) = &gpu {
+                    let _ = task
+                        .log
+                        .send(format!("[GPU] {} ({})", gpu.name, gpu.backend));
+                }
+                let outcome = render_job(&blender, &task, pin.as_deref());
+                let _ = task.done.send(outcome);
+            }
+        });
+    }
 }
 
-fn render_job(blender: &str, job: &Job, cancel: &AtomicBool, log: &Sender<String>) -> Outcome {
+fn render_job(blender: &str, task: &Task, pin: Option<&str>) -> Outcome {
+    let Task {
+        job, cancel, log, ..
+    } = task;
     let mut failed = Vec::new();
     for scene in job.enabled_scenes() {
         if cancel.load(Ordering::Relaxed) {
@@ -70,7 +90,7 @@ fn render_job(blender: &str, job: &Job, cancel: &AtomicBool, log: &Sender<String
             "==== {}  frames {}-{} ====",
             scene.name, scene.start, scene.end
         ));
-        match run_scene(blender, &job.file, scene, cancel, log) {
+        match run_scene(blender, &job.file, scene, pin, cancel, log) {
             Ok(status) if status.success() => {}
             Ok(status) => {
                 let _ = log.send(format!("[FAILED] {} ({status})", scene.name));
@@ -100,11 +120,12 @@ fn run_scene(
     blender: &str,
     file: &str,
     scene: &Scene,
+    pin: Option<&str>,
     cancel: &AtomicBool,
     log: &Sender<String>,
 ) -> std::io::Result<ExitStatus> {
     let mut child = blender_command(blender)
-        .args(args(file, scene))
+        .args(args(file, scene, pin))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -159,7 +180,7 @@ mod tests {
     #[test]
     fn builds_args_in_blender_order() {
         assert_eq!(
-            args("\"D:\\a.blend\"", &scene("")),
+            args("\"D:\\a.blend\"", &scene(""), None),
             [
                 "-b",
                 "D:\\a.blend",
@@ -177,7 +198,7 @@ mod tests {
     #[test]
     fn output_goes_before_animation_flag() {
         assert_eq!(
-            args("a.blend", &scene("D:\\out\\")),
+            args("a.blend", &scene("D:\\out\\"), Some("pin")),
             [
                 "-b",
                 "a.blend",
@@ -189,6 +210,8 @@ mod tests {
                 "2",
                 "-o",
                 "D:\\out\\",
+                "--python-expr",
+                "pin",
                 "-a"
             ]
         );
