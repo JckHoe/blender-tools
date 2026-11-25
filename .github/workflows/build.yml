@@ -24,6 +24,9 @@ jobs:
           name: blender-render-queue
           path: target/release/blender-render-queue.exe
       - if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: cp target/release/blender-render-queue.exe "blender-render-queue-${GITHUB_REF_NAME}.exe"
+      - if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/blender-render-queue.exe
+          files: blender-render-queue-${{ github.ref_name }}.exe
