@@ -44,47 +44,56 @@ pub fn blender_command(blender: &str) -> Command {
     cmd
 }
 
-pub fn spawn(
-    blender: String,
-    job: Job,
-    cancel: Arc<AtomicBool>,
-    log: Sender<String>,
-) -> JoinHandle<Outcome> {
+pub struct Task {
+    pub job: Job,
+    pub cancel: Arc<AtomicBool>,
+    pub log: Sender<String>,
+    pub done: Sender<Outcome>,
+}
+
+pub fn spawn(blender: String, tasks: Vec<Task>) {
     thread::spawn(move || {
-        let mut failed = Vec::new();
-        for scene in job.enabled_scenes() {
-            if cancel.load(Ordering::Relaxed) {
-                break;
+        for task in tasks {
+            let outcome = render_job(&blender, &task.job, &task.cancel, &task.log);
+            let _ = task.done.send(outcome);
+        }
+    });
+}
+
+fn render_job(blender: &str, job: &Job, cancel: &AtomicBool, log: &Sender<String>) -> Outcome {
+    let mut failed = Vec::new();
+    for scene in job.enabled_scenes() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let _ = log.send(format!(
+            "==== {}  frames {}-{} ====",
+            scene.name, scene.start, scene.end
+        ));
+        match run_scene(blender, &job.file, scene, cancel, log) {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                let _ = log.send(format!("[FAILED] {} ({status})", scene.name));
+                failed.push(scene.name.clone());
             }
-            let _ = log.send(format!(
-                "==== {}  frames {}-{} ====",
-                scene.name, scene.start, scene.end
-            ));
-            match run_scene(&blender, &job.file, scene, &cancel, &log) {
-                Ok(status) if status.success() => {}
-                Ok(status) => {
-                    let _ = log.send(format!("[FAILED] {} ({status})", scene.name));
-                    failed.push(scene.name.clone());
-                }
-                Err(e) => {
-                    let _ = log.send(format!("[ERROR] {}: {e}", scene.name));
-                    failed.push(scene.name.clone());
-                }
+            Err(e) => {
+                let _ = log.send(format!("[ERROR] {}: {e}", scene.name));
+                failed.push(scene.name.clone());
             }
         }
-        let (summary, outcome) = if cancel.load(Ordering::Relaxed) {
-            ("Cancelled.".to_string(), Outcome::Cancelled)
-        } else if failed.is_empty() {
-            ("All renders done.".to_string(), Outcome::Done)
-        } else {
-            (
-                format!("Done with failures: {}", failed.join(", ")),
-                Outcome::Failed,
-            )
-        };
-        let _ = log.send(summary);
-        outcome
-    })
+    }
+    let (summary, outcome) = if cancel.load(Ordering::Relaxed) {
+        ("Cancelled.".to_string(), Outcome::Cancelled)
+    } else if failed.is_empty() {
+        ("All renders done.".to_string(), Outcome::Done)
+    } else {
+        (
+            format!("Done with failures: {}", failed.join(", ")),
+            Outcome::Failed,
+        )
+    };
+    let _ = log.send(summary);
+    outcome
 }
 
 fn run_scene(

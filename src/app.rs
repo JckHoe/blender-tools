@@ -1,11 +1,10 @@
 use crate::config::{Config, Job, Scene};
-use crate::render::Outcome;
+use crate::render::{Outcome, Task};
 use crate::{render, scenes};
 use eframe::egui;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 const MAX_LOG_BYTES: usize = 500_000;
@@ -13,7 +12,8 @@ const MAX_LOG_BYTES: usize = 500_000;
 struct Run {
     log: Receiver<String>,
     cancel: Arc<AtomicBool>,
-    handle: Option<JoinHandle<Outcome>>,
+    done: Receiver<Outcome>,
+    started: bool,
 }
 
 struct Scan {
@@ -35,8 +35,12 @@ impl JobState {
     }
 
     fn status(&self) -> (&'static str, &'static str) {
-        if self.run.is_some() {
-            return ("●", "rendering");
+        if let Some(run) = &self.run {
+            return match (run.cancel.load(Ordering::Relaxed), run.started) {
+                (true, _) => ("⏹", "stopping"),
+                (false, false) => ("⏳", "queued"),
+                (false, true) => ("●", "rendering"),
+            };
         }
         if self.scan.is_some() {
             return ("…", "reading scenes");
@@ -55,25 +59,42 @@ impl JobState {
     }
 
     fn start(&mut self, blender: &str, job: &Job) {
+        if let Some(task) = self.prepare(blender, job) {
+            render::spawn(blender.to_string(), vec![task]);
+        }
+    }
+
+    fn prepare(&mut self, blender: &str, job: &Job) -> Option<Task> {
         self.log.clear();
         self.outcome = None;
         if let Err(e) = job.validate(blender) {
             self.push(&format!("[ERROR] {e}"));
-            return;
+            return None;
         }
-        let (tx, rx) = mpsc::channel();
+        let (log, log_rx) = mpsc::channel();
+        let (done, done_rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let handle = render::spawn(blender.to_string(), job.clone(), cancel.clone(), tx);
         self.run = Some(Run {
-            log: rx,
-            cancel,
-            handle: Some(handle),
+            log: log_rx,
+            cancel: cancel.clone(),
+            done: done_rx,
+            started: false,
         });
+        Some(Task {
+            job: job.clone(),
+            cancel,
+            log,
+            done,
+        })
     }
 
-    fn stop(&self) {
-        if let Some(run) = &self.run {
-            run.cancel.store(true, Ordering::Relaxed);
+    fn stop(&mut self) {
+        let Some(run) = &self.run else { return };
+        run.cancel.store(true, Ordering::Relaxed);
+        if !run.started {
+            self.run = None;
+            self.outcome = Some(Outcome::Cancelled);
+            self.push("Cancelled.");
         }
     }
 
@@ -119,6 +140,7 @@ impl JobState {
         let finished = loop {
             match run.log.try_recv() {
                 Ok(line) => {
+                    run.started = true;
                     self.log.push_str(&line);
                     self.log.push('\n');
                 }
@@ -127,7 +149,7 @@ impl JobState {
             }
         };
         if finished {
-            self.outcome = run.handle.take().and_then(|h| h.join().ok());
+            self.outcome = run.done.try_recv().ok();
             self.run = None;
         }
         if self.log.len() > MAX_LOG_BYTES {
@@ -143,6 +165,7 @@ pub struct App {
     saved: Config,
     states: Vec<JobState>,
     selected: usize,
+    picks: Option<Vec<bool>>,
 }
 
 impl App {
@@ -153,6 +176,7 @@ impl App {
             saved: config.clone(),
             config,
             selected: 0,
+            picks: None,
         }
     }
 
@@ -166,6 +190,37 @@ impl App {
         self.config.jobs.remove(i);
         self.states.remove(i);
         self.selected = self.selected.min(self.config.jobs.len().saturating_sub(1));
+    }
+
+    fn problem(&self, i: usize) -> Option<String> {
+        let state = &self.states[i];
+        if state.busy() {
+            return Some(state.status().1.into());
+        }
+        self.config.jobs[i].validate(&self.config.blender).err()
+    }
+
+    fn open_picker(&mut self) {
+        let picks = (0..self.config.jobs.len())
+            .map(|i| {
+                self.problem(i).is_none() && !matches!(self.states[i].outcome, Some(Outcome::Done))
+            })
+            .collect();
+        self.picks = Some(picks);
+    }
+
+    fn render_all(&mut self, picks: &[bool]) {
+        let tasks = (self.states.iter_mut().zip(&self.config.jobs).zip(picks))
+            .filter(|((state, _), on)| **on && !state.busy())
+            .filter_map(|((state, job), _)| state.prepare(&self.config.blender, job))
+            .collect::<Vec<_>>();
+        if !tasks.is_empty() {
+            render::spawn(self.config.blender.clone(), tasks);
+        }
+    }
+
+    fn stop_all(&mut self) {
+        self.states.iter_mut().for_each(JobState::stop);
     }
 
     fn poll(&mut self) {
@@ -200,6 +255,24 @@ impl App {
     }
 
     fn jobs_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let idle = self.states.iter().any(|s| !s.busy());
+            if ui
+                .add_enabled(idle, egui::Button::new("▶ Render all"))
+                .on_hover_text("Pick jobs to render one after another")
+                .clicked()
+            {
+                self.open_picker();
+            }
+            let running = self.states.iter().any(|s| s.run.is_some());
+            if ui
+                .add_enabled(running, egui::Button::new("⏹ Stop all"))
+                .clicked()
+            {
+                self.stop_all();
+            }
+        });
+        ui.separator();
         for (i, (job, state)) in self.config.jobs.iter().zip(&self.states).enumerate() {
             let (icon, status) = state.status();
             if ui
@@ -219,8 +292,7 @@ impl App {
     fn job_ui(&mut self, ui: &mut egui::Ui) {
         let i = self.selected;
         let blender = self.config.blender.clone();
-        let (Some(job), Some(state)) = (self.config.jobs.get_mut(i), self.states.get_mut(i))
-        else {
+        let (Some(job), Some(state)) = (self.config.jobs.get_mut(i), self.states.get_mut(i)) else {
             ui.label("Add a job with ➕ New job.");
             return;
         };
@@ -268,6 +340,71 @@ impl App {
 
         if remove {
             self.remove_job(i);
+        }
+    }
+
+    fn picker_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut picks) = self.picks.take() else {
+            return;
+        };
+        let problems: Vec<_> = (0..picks.len()).map(|i| self.problem(i)).collect();
+        for (on, problem) in picks.iter_mut().zip(&problems) {
+            *on &= problem.is_none();
+        }
+        let chosen = || self.config.jobs.iter().zip(&picks).filter(|(_, on)| **on);
+        let count = chosen().count();
+        let scenes: usize = chosen().map(|(j, _)| j.enabled_scenes().count()).sum();
+        let frames: u32 = chosen().map(|(j, _)| j.frames()).sum();
+
+        let mut start = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("render_all")).show(ctx, |ui| {
+            ui.heading("Render all");
+            ui.label("Selected jobs render one after another.");
+            ui.separator();
+            egui::Grid::new("render_all_jobs")
+                .num_columns(5)
+                .striped(true)
+                .show(ui, |ui| {
+                    for header in ["", "Job", "Scenes", "Frames", ""] {
+                        ui.strong(header);
+                    }
+                    ui.end_row();
+                    for (i, job) in self.config.jobs.iter().enumerate() {
+                        let note = match (&problems[i], &self.states[i].outcome) {
+                            (Some(p), _) => p.as_str(),
+                            (None, Some(Outcome::Done)) => "already done",
+                            _ => "",
+                        };
+                        ui.add_enabled(
+                            problems[i].is_none(),
+                            egui::Checkbox::without_text(&mut picks[i]),
+                        );
+                        ui.label(job.name());
+                        ui.label(job.enabled_scenes().count().to_string());
+                        ui.label(job.frames().to_string());
+                        ui.weak(note);
+                        ui.end_row();
+                    }
+                });
+            ui.separator();
+            ui.label(format!("{count} jobs · {scenes} scenes · {frames} frames"));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                start = ui
+                    .add_enabled(
+                        count > 0,
+                        egui::Button::new(format!("▶ Render {count} jobs")),
+                    )
+                    .clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+
+        if start {
+            self.render_all(&picks);
+        } else if !cancel && !modal.should_close() {
+            self.picks = Some(picks);
         }
     }
 }
@@ -374,6 +511,7 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| self.job_ui(ui));
+        self.picker_ui(ctx);
 
         self.autosave();
     }

@@ -109,6 +109,12 @@ impl Job {
         self.scenes.iter().filter(|s| s.enabled)
     }
 
+    pub fn frames(&self) -> u32 {
+        self.enabled_scenes()
+            .map(|s| (s.end + 1).saturating_sub(s.start))
+            .sum()
+    }
+
     pub fn validate_paths(&self, blender: &str) -> Result<(), String> {
         if !Path::new(clean(blender)).is_file() {
             return Err(format!("Blender not found: {blender}"));
@@ -219,6 +225,13 @@ mod tests {
         assert_eq!(j.apply_scenes("a.blend", vec![scene("BG", 1)]), (false, 0));
         assert_eq!(j.scenes.len(), 1);
         assert_eq!(j.scenes[0].end, 1);
+    }
+
+    #[test]
+    fn frames_counts_enabled_scenes_inclusive() {
+        let mut j = job("", vec![scene("A", 10), scene("B", 1), scene("C", 5)]);
+        j.scenes[2].enabled = false;
+        assert_eq!(j.frames(), 11);
     }
 
     #[test]

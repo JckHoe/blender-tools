@@ -19,9 +19,10 @@ Blender exe [.................] Browse        ← shared by all jobs
 
 - **Multiple jobs**: one job per `.blend` file, each with its own scene list, log and Render/Stop.
 - **Parallel renders**: every started job runs its own Blender process; starting one never waits on another.
+- **Render all**: pick jobs in a popup (scenes and frame totals shown, finished jobs unchecked), then they render one after another, for unattended batches (e.g. over a weekend). Failed jobs don't stop the queue. **Stop all** cancels everything.
 - **Scene loading**: picking a `.blend` reads its scenes and frame ranges automatically. "Load scenes" refreshes frame ranges and adds new scenes, keeping your per-scene settings.
 - **Per-scene options**: enable/disable, frame range, optional output folder.
-- **Status at a glance**: ○ idle, … reading scenes, ● rendering, ✔ done, ✖ failed, ⏹ cancelled.
+- **Status at a glance**: ○ idle, … reading scenes, ⏳ queued, ● rendering, ✔ done, ✖ failed, ⏹ cancelled.
 - **Autosave**: settings are saved to `render-queue.json` next to the exe. Old single-file configs from v0.1.x are migrated to the first job.
 
 Scenes within one job render one after another. Running many jobs at once shares CPU/GPU/RAM, so start only as many as your machine can handle.
@@ -31,7 +32,7 @@ Scenes within one job render one after another. Running many jobs at once shares
 1. Set **Blender exe** (e.g. `C:\Program Files\Blender Foundation\Blender 4.x\blender.exe`).
 2. Click **➕ New job** and pick a `.blend` file. Its scenes are loaded automatically.
 3. Adjust scenes and output folders, then click **▶ Render**.
-4. Add more jobs and render them while the first is still running.
+4. Add more jobs and render them while the first is still running, or click **▶ Render all** to render them back to back.
 
 Each scene is rendered with:
 
